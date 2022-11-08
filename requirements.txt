@@ -1,0 +1,5 @@
+capstone~=4.0.1
+keystone~=20.0.0
+keystone_engine==0.9.2
+lighthouse
+pwn==1.0
