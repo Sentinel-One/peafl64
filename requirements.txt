@@ -3,3 +3,9 @@ keystone~=20.0.0
 keystone_engine==0.9.2
 lighthouse
 pwn==1.0
+certifi>=2023.7.22 # not directly required, pinned by Snyk to avoid a vulnerability
+cryptography>=41.0.6 # not directly required, pinned by Snyk to avoid a vulnerability
+mako>=1.2.2 # not directly required, pinned by Snyk to avoid a vulnerability
+paramiko>=3.4.0 # not directly required, pinned by Snyk to avoid a vulnerability
+pygments>=2.15.0 # not directly required, pinned by Snyk to avoid a vulnerability
+requests>=2.31.0 # not directly required, pinned by Snyk to avoid a vulnerability
