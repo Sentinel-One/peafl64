@@ -304,7 +304,7 @@ def calc_bytes_added(file_offset: int, is_target: bool = False) -> int:
     return diff
 
 
-def get_updated_dynamic_relocs() -> Optional[Dict[int, List[int]]]:
+def get_updated_dynamic_relocs() -> Optional[Dict[int, List[Tuple[int,int]]]]:
     """
     Get the updated dynamic relocation entries.
     :return: None if the PE has no dynamic relocations, Dictionary of symbols to list of updated type offsets otherwise
@@ -319,7 +319,7 @@ def get_updated_dynamic_relocs() -> Optional[Dict[int, List[int]]]:
     for dynamic_reloc in drt.dynamic_relocations:
         updated_rvas = []
         for base_reloc in dynamic_reloc.base_relocations:
-            updated_rvas.extend([update_addr(type_offset) for type_offset in base_reloc.type_offsets])
+            updated_rvas.extend([(update_addr(rva), offset_type) for rva, offset_type in base_reloc.type_offsets])
         updated_dyn_relocs[dynamic_reloc.symbol] = updated_rvas
 
     return updated_dyn_relocs
@@ -375,7 +375,7 @@ def add_to_reloc(updated_relocs: List[BaseRelocationData], addr_list: List[int],
             reloc_va_dict[relocation_struct.VirtualAddress] = last_reloc_index
 
 
-def create_updated_drt(dynamic_reloc_mapping: Dict[int, List[int]]) -> bytearray:
+def create_updated_drt(dynamic_reloc_mapping: Dict[int, List[Tuple[int,int]]]) -> bytearray:
     """
     Creates a new Dynamic Relocation Table (also called DVRT) that's based on the mapping we've got.
     Then it dumps that DRT into a bytearray.
@@ -387,11 +387,11 @@ def create_updated_drt(dynamic_reloc_mapping: Dict[int, List[int]]) -> bytearray
         pages = {}
         base_relocs = []
 
-        for type_offset in type_offsets:
-            page = type_offset & ~0xFFF
+        for rva, offset_type in type_offsets:
+            page = rva & ~0xFFF
             if page not in pages:
                 pages[page] = []
-            pages[page].append(type_offset)
+            pages[page].append((rva,offset_type))
 
         for page, page_offsets in pages.items():
             base_relocs.append(IMAGE_BASE_RELOCATION.from_data(page, page_offsets))
@@ -402,7 +402,7 @@ def create_updated_drt(dynamic_reloc_mapping: Dict[int, List[int]]) -> bytearray
     return drt.dump()
 
 
-def build_reloc_section(updated_reloc: List[BaseRelocationData], updated_dynamic_reloc: Optional[Dict[int, List[int]]],
+def build_reloc_section(updated_reloc: List[BaseRelocationData], updated_dynamic_reloc: Optional[Dict[int, List[Tuple[int,int]]]],
                         is_verbose: bool) -> bytearray:
     """
     Finalizes the contents of the relocations section with the new relocations.
