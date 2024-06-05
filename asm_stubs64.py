@@ -1,4 +1,4 @@
-from keystone import Ks, KS_ARCH_X86, KS_MODE_64
+from keystone.keystone import Ks, KS_ARCH_X86, KS_MODE_64
 
 import pefile
 
