@@ -20,7 +20,8 @@ import pefile
 import seh
 from seh import ExInfo, UnwindInfo
 from drt import (DRTException, IMAGE_DYNAMIC_RELOCATION_TABLE, IMAGE_DYNAMIC_RELOCATION, IMAGE_BASE_RELOCATION,
-                 DYNAMIC_RELOC_TABLE_OFFSET_FIELD_OFFSET)
+                 DYNAMIC_RELOC_TABLE_OFFSET_FIELD_OFFSET, IMAGE_FUNCTION_OVERRIDE_HEADER, IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION, 
+                 IMAGE_BDD_DYNAMIC_RELOCATION, IMAGE_BDD_INFO)
 from pefile import PE, SectionStructure, RelocationData, BaseRelocationData, RELOCATION_TYPE
 from utils import (pack_64bit, pack_32bit, pack_16bit, unpack_32bit, unpack_64bit, is_value_32bit, bdata_replace,
                    data_replace, delete_if_exists, in_range, get_closest_or_equal, dword, is_exe, is_driver,
@@ -73,13 +74,14 @@ class RelativeInstruction:
 
 
 class Code:
-    def __init__(self, virtual_address: int, expand: bytes, align: bytes, shellcode: bytes, total_len: int):
+    def __init__(self, virtual_address: int, expand: bytes, align: bytes, shellcode: bytes, total_len: int, is_bb_start: bool = False):
         self.virtual_address = virtual_address
         # New bytes we add for relative instruction expansion
         self.expand = expand
         self.align = align
         self.shellcode = shellcode
         self.total_len = total_len
+        self.is_bb_start = is_bb_start
 
     def __str__(self):
         return str([hex(self.virtual_address), self.expand, self.align, self.shellcode, self.total_len])
@@ -186,13 +188,14 @@ def clear_stub_and_certificate() -> str:
     return new_name
 
 
-def inject_code(addr: int, injections: Dict[int, Code], shellcode: bytes = b'', expand: bytes = b'') -> None:
+def inject_code(addr: int, injections: Dict[int, Code], shellcode: bytes = b'', expand: bytes = b'', is_bb_start: bool = False) -> None:
     """
     Creates an injection struct for an address and inserts it into the injections dict.
     :param addr: Address to inject to
     :param injections: A dict that holds info about all the injections.
     :param shellcode: Shellcode to inject
     :param expand: New bytes to add for relative instruction expansion (e.g. short jmp to far jmp)
+    :param is_bb_start: Is it injection of a start of a basic block
     :return:
     """
     # expand is a partial operand for expanding from short jump to long jump
@@ -216,7 +219,7 @@ def inject_code(addr: int, injections: Dict[int, Code], shellcode: bytes = b'', 
         inj_struct.shellcode = shellcode + inj_struct.shellcode
         inj_struct.total_len = len(inj_struct.shellcode + inj_struct.expand + inj_struct.align)
     else:
-        injections[addr_offset_in_file] = Code(addr, expand, align, shellcode, len(expand + shellcode + align))
+        injections[addr_offset_in_file] = Code(addr, expand, align, shellcode, len(expand + shellcode + align), is_bb_start)
         # for optimization
         if not hasattr(section, 'addr_set'):
             section.addr_set = []
@@ -304,10 +307,14 @@ def calc_bytes_added(file_offset: int, is_target: bool = False) -> int:
     return diff
 
 
-def get_updated_dynamic_relocs() -> Optional[Dict[int, List[Tuple[int,int]]]]:
+def get_updated_dynamic_relocs(injections: Dict[int, Code]):
     """
     Get the updated dynamic relocation entries.
-    :return: None if the PE has no dynamic relocations, Dictionary of symbols to list of updated type offsets otherwise
+    :param injections: The dict of injections, that we use to check if a relocation is on a start 
+                       of a basic block
+    :return: None if the PE has no dynamic relocations, otherwise: 
+             Dictionary of symbols to list of updated type offsets for regular dynamic relocations
+             Also dict of function override data
     """
     global pe
     try:
@@ -315,14 +322,37 @@ def get_updated_dynamic_relocs() -> Optional[Dict[int, List[Tuple[int,int]]]]:
     except DRTException:
         return None
 
+    func_override_relocs = {}
     updated_dyn_relocs = {}
+
     for dynamic_reloc in drt.dynamic_relocations:
         updated_rvas = []
-        for base_reloc in dynamic_reloc.base_relocations:
-            updated_rvas.extend([(update_addr(rva), offset_type) for rva, offset_type in base_reloc.type_offsets])
-        updated_dyn_relocs[dynamic_reloc.symbol] = updated_rvas
+        func_override_fixup_rvas = []
 
-    return updated_dyn_relocs
+        # Symbol 7 means function override
+        if dynamic_reloc.symbol == 7:
+            for func_override in dynamic_reloc.function_override_header.func_override_info:
+                func_override_rva_list = [update_addr(rva) for rva in func_override.rva_list]
+                for base_reloc in func_override.base_relocations:
+                    for rva, offset_type in base_reloc.type_offsets:
+                        file_offset = rva2ofs(rva)
+                        # In cases where we have a dynamic relocation in a start of basic block, we need to skip the shellcode we inserted
+                        # so that we relocate the correct instruction
+                        skip_bytes = len(injections[file_offset].shellcode) if file_offset in injections and injections[file_offset].is_bb_start else 0
+                        func_override_fixup_rvas.append((update_addr(rva) + skip_bytes, offset_type))
+            func_override.original_rva = update_addr(func_override.original_rva)
+            func_override_relocs[dynamic_reloc.function_override_header] = {func_override: (func_override_rva_list, func_override_fixup_rvas)}
+        else: 
+            for base_reloc in dynamic_reloc.base_relocations:
+                for rva, offset_type in base_reloc.type_offsets:
+                        file_offset = rva2ofs(rva)
+                        # In cases where we have a dynamic relocation in a start of basic block, we need to skip the shellcode we inserted
+                        # so that we relocate the correct instruction
+                        skip_bytes = len(injections[file_offset].shellcode) if file_offset in injections and injections[file_offset].is_bb_start else 0
+                        updated_rvas.append((update_addr(rva) + skip_bytes, offset_type))
+            updated_dyn_relocs[dynamic_reloc.symbol] = updated_rvas
+
+    return updated_dyn_relocs, func_override_relocs
 
 
 def new_reloc_entry(addr: int, entry_type: int) -> RelocationData:
@@ -375,18 +405,20 @@ def add_to_reloc(updated_relocs: List[BaseRelocationData], addr_list: List[int],
             reloc_va_dict[relocation_struct.VirtualAddress] = last_reloc_index
 
 
-def create_updated_drt(dynamic_reloc_mapping: Dict[int, List[Tuple[int,int]]]) -> bytearray:
+def create_updated_dvrt(dynamic_reloc_mapping) -> bytearray:
     """
-    Creates a new Dynamic Relocation Table (also called DVRT) that's based on the mapping we've got.
+    Creates a new Dynamic Value Relocation Table (also called DVRT) that's based on the mapping we've got.
     Then it dumps that DRT into a bytearray.
     :param dynamic_reloc_mapping: Dictionary of symbols to list of updated type offsets (RVAs)
     :return: A packed updated Dynamic Relocation Table
     """
     dynamic_relocs = []
-    for symbol, type_offsets in dynamic_reloc_mapping.items():
+    for symbol, type_offsets in dynamic_reloc_mapping[0].items():
         pages = {}
         base_relocs = []
 
+        # RVAs were updated and that maybe caused them to move a page
+        # Here we rebuild it
         for rva, offset_type in type_offsets:
             page = rva & ~0xFFF
             if page not in pages:
@@ -394,20 +426,45 @@ def create_updated_drt(dynamic_reloc_mapping: Dict[int, List[Tuple[int,int]]]) -
             pages[page].append((rva,offset_type))
 
         for page, page_offsets in pages.items():
-            base_relocs.append(IMAGE_BASE_RELOCATION.from_data(page, page_offsets))
+            base_relocs.append(IMAGE_BASE_RELOCATION.from_data(page, page_offsets, is_word_sized=symbol!=3))
 
-        dynamic_relocs.append(IMAGE_DYNAMIC_RELOCATION.from_data(symbol, base_relocs))
+        dynamic_relocs.append(IMAGE_DYNAMIC_RELOCATION.from_data(symbol, base_relocations=base_relocs, function_override_header=None))
+    
+    for fo_header, data in dynamic_reloc_mapping[1].items():
+        fo_relocs: List[IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION] = []
+        for fo, values in data.items():
+            rva_list, fixup_rvas = values[0], values[1]
+            fo.rva_list = rva_list
+            pages = {}
+            base_relocs = []
+
+            # RVAs were updated and that maybe caused them to move a page
+            # Here we rebuild it
+            for rva, offset_type in fixup_rvas:
+                page = rva & ~0xFFF
+                if page not in pages:
+                    pages[page] = []
+                pages[page].append((rva,offset_type))
+
+            for page, page_offsets in pages.items():
+                base_relocs.append(IMAGE_BASE_RELOCATION.from_data(page, page_offsets, is_word_sized=True))
+
+            fo_relocs.append(IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION.from_data(fo.original_rva, fo.bdd_offset, fo.rva_list, base_relocs))
+
+        new_fo_header = IMAGE_FUNCTION_OVERRIDE_HEADER.from_data(fo_relocs, fo_header.bdd_info)
+        dynamic_relocs.append(IMAGE_DYNAMIC_RELOCATION.from_data(symbol=7, base_relocations=[], function_override_header=new_fo_header))
 
     drt = IMAGE_DYNAMIC_RELOCATION_TABLE.from_data(dynamic_relocs)
     return drt.dump()
 
 
-def build_reloc_section(updated_reloc: List[BaseRelocationData], updated_dynamic_reloc: Optional[Dict[int, List[Tuple[int,int]]]],
+def build_reloc_section(updated_reloc: List[BaseRelocationData], updated_dynamic_reloc,
                         is_verbose: bool) -> bytearray:
     """
     Finalizes the contents of the relocations section with the new relocations.
     :param updated_reloc: List of all the relocations
     :param updated_dynamic_reloc: Dictionary of symbols to list of updated type offsets for dynamic relocations
+                                  And dict of function override relocation data
     :param is_verbose: For debugging purposes
     :return: The data of the updated relocation section
     """
@@ -443,7 +500,7 @@ def build_reloc_section(updated_reloc: List[BaseRelocationData], updated_dynamic
 
     # Handle the dynamic relocation table that also resides in the .reloc section
     if updated_dynamic_reloc is not None:
-        drt_raw = create_updated_drt(dynamic_reloc_mapping=updated_dynamic_reloc)
+        drt_raw = create_updated_dvrt(dynamic_reloc_mapping=updated_dynamic_reloc)
         load_config_base_offset = pe.DIRECTORY_ENTRY_LOAD_CONFIG.struct.get_file_offset()
         load_config_sec = get_sec_by_ofs(load_config_base_offset)
         # The new drt starts after the normal relocations end
@@ -1183,7 +1240,7 @@ def process_pe(ida: Dict, args, injections: Dict[int, Code]) -> Tuple[int, bytea
     if hasattr(args, 'pe_afl') and not args.nop:
         create_relocs_for_cov_section(updated_reloc, args, injections)
 
-    updated_dynamic_relocs = get_updated_dynamic_relocs()
+    updated_dynamic_relocs = get_updated_dynamic_relocs(injections)
     append_reloc = build_reloc_section(updated_reloc, updated_dynamic_relocs, args.verbose)
 
     logging.info('Updating Export table')
@@ -1367,7 +1424,7 @@ def run(ida: Dict, args, shellcode_for_addr: Dict[int, bytes]) -> None:
     injections_dict: Dict[int, Code] = {}  # the keys are physical offsets in the file of basic blocks to instrument
     # basic block instrument
     for basic_block_address, shellcode in shellcode_for_addr.items():
-        inject_code(basic_block_address, injections_dict, shellcode)
+        inject_code(basic_block_address, injections_dict, shellcode, is_bb_start=True)
 
     # entry point instrument
     if args.entry:
