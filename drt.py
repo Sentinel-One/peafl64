@@ -93,7 +93,7 @@ class IMAGE_DYNAMIC_RELOCATION:
         self.symbol: int = None
         self.base_reloc_size: int = None
         self.base_relocations: List[IMAGE_BASE_RELOCATION] = []
-        self.function_override_info: IMAGE_FUNCTION_OVERRIDE_HEADER = None
+        self.function_override_header: IMAGE_FUNCTION_OVERRIDE_HEADER = None
 
     @classmethod
     def from_bytes(cls, raw_data: bytes) -> 'IMAGE_DYNAMIC_RELOCATION':
@@ -113,29 +113,34 @@ class IMAGE_DYNAMIC_RELOCATION:
             return dynamic_reloc
         # Function Override (ltfs) stuff
         elif dynamic_reloc.symbol == 7:
-            dynamic_reloc.function_override_info = IMAGE_FUNCTION_OVERRIDE_HEADER.from_bytes(reloc_data)
-        # Retpoline, import optimization and KASLR
+            dynamic_reloc.function_override_header = IMAGE_FUNCTION_OVERRIDE_HEADER.from_bytes(reloc_data)
+        # Retpoline and KASLR
         else:
             idx = 0
             while idx <= dynamic_reloc.base_reloc_size - IMAGE_BASE_RELOCATION.sizeof:
-                reloc = IMAGE_BASE_RELOCATION.from_bytes(reloc_data[idx:])
+                # Import optimization has a bigger struct
+                reloc = IMAGE_BASE_RELOCATION.from_bytes(reloc_data[idx:], is_word_sized=dynamic_reloc.symbol!=3)
                 idx += reloc.size_of_block
                 dynamic_reloc.base_relocations.append(reloc)
         return dynamic_reloc
 
     @classmethod
-    def from_data(cls, symbol: int, base_relocations: List['IMAGE_BASE_RELOCATION'], function_override_info: IMAGE_FUNCTION_OVERRIDE_HEADER) -> 'IMAGE_DYNAMIC_RELOCATION':
+    def from_data(cls, symbol: int, base_relocations: List['IMAGE_BASE_RELOCATION'], function_override_header: 'IMAGE_FUNCTION_OVERRIDE_HEADER') -> 'IMAGE_DYNAMIC_RELOCATION':
         dynamic_reloc = cls()
         dynamic_reloc.symbol = symbol
-        dynamic_reloc.base_reloc_size = sum([reloc.size_of_block for reloc in base_relocations])
+        dynamic_reloc.base_reloc_size = 0
+        if base_relocations:
+            dynamic_reloc.base_reloc_size = sum([reloc.size_of_block for reloc in base_relocations])
+        if function_override_header:
+            dynamic_reloc.base_reloc_size += function_override_header.sizeof + function_override_header.func_override_size + function_override_header.bdd_info.sizeof + function_override_header.bdd_info.bdd_size
         dynamic_reloc.base_relocations = base_relocations
-        dynamic_reloc.function_override_info = function_override_info
+        dynamic_reloc.function_override_header = function_override_header
         return dynamic_reloc
 
     def __repr__(self) -> str:
         return f"Symbol: {hex(self.symbol)} | Base Reloc Size: {hex(self.base_reloc_size)} \n" \
                f"Base Relocations: {self.base_relocations}\n" \
-               f"Function Override Info: {self.function_override_info}\n"
+               f"Function Override Info: {self.function_override_header}\n"
 
     def dump(self) -> bytearray:
         packed_dynamic_reloc = bytearray(struct.pack('<QI', self.symbol, self.base_reloc_size))
@@ -143,8 +148,8 @@ class IMAGE_DYNAMIC_RELOCATION:
         # Only one of these lists will have values
         for base_relocation in self.base_relocations:
             packed_dynamic_reloc += base_relocation.dump()
-        if self.function_override_info:
-            packed_dynamic_reloc += self.function_override_info.dump()
+        if self.function_override_header:
+            packed_dynamic_reloc += self.function_override_header.dump()
 
         return packed_dynamic_reloc
 
@@ -161,8 +166,11 @@ class IMAGE_BASE_RELOCATION:
         self.type_offsets: List[Tuple[int, int]] = None
         self.has_padding: bool = None
 
+        # True for all type offsets other than those for import optimization
+        self.is_word_sized: bool = True
+
     @classmethod
-    def from_bytes(cls, raw_data: bytes) -> 'IMAGE_BASE_RELOCATION':
+    def from_bytes(cls, raw_data: bytes, is_word_sized: bool = True) -> 'IMAGE_BASE_RELOCATION':
         """
         Creates an IMAGE_BASE_RELOCATION object from the raw data
         :param raw_data: raw data of the IMAGE_BASE_RELOCATION
@@ -170,10 +178,14 @@ class IMAGE_BASE_RELOCATION:
         """
         reloc = cls()
         reloc.virtual_address, reloc.size_of_block = struct.unpack('<II', raw_data[:reloc.sizeof])
-        reloc.num_of_type_offsets = int((reloc.size_of_block - reloc.sizeof) / 2)
-
-        type_offset_list = struct.unpack('<' + 'H' * reloc.num_of_type_offsets, \
-                                         raw_data[reloc.sizeof:reloc.sizeof + 2 * reloc.num_of_type_offsets])
+        reloc.is_word_sized = is_word_sized
+        if is_word_sized:
+            struct_type, struct_size = 'H', 2
+        else:
+            struct_type, struct_size = 'I', 4
+        reloc.num_of_type_offsets = int((reloc.size_of_block - reloc.sizeof) / struct_size)
+        type_offset_list = struct.unpack('<' + struct_type * reloc.num_of_type_offsets, \
+                                         raw_data[reloc.sizeof:reloc.sizeof + struct_size * reloc.num_of_type_offsets])
         
         reloc.type_offsets = []
         for type_offset in type_offset_list:
@@ -183,7 +195,7 @@ class IMAGE_BASE_RELOCATION:
 
         reloc.has_padding = False
         # The last type offset is padding if there is an odd number of type offsets in the block
-        if reloc.type_offsets[-1][0] - reloc.virtual_address == 0:
+        if is_word_sized and reloc.type_offsets[-1][0] - reloc.virtual_address == 0:
             reloc.type_offsets = reloc.type_offsets[:-1]
             reloc.has_padding = True
             reloc.num_of_type_offsets -= 1
@@ -191,7 +203,7 @@ class IMAGE_BASE_RELOCATION:
         return reloc
 
     @classmethod
-    def from_data(cls, virtual_address: int, type_offsets: List[Tuple[int, int]]) -> 'IMAGE_BASE_RELOCATION':
+    def from_data(cls, virtual_address: int, type_offsets: List[Tuple[int, int]], is_word_sized: bool = True) -> 'IMAGE_BASE_RELOCATION':
         """
         Creates an IMAGE_BASE_RELOCATION object from the given data
         :param virtual_address: virtual address of the base relocation
@@ -200,14 +212,19 @@ class IMAGE_BASE_RELOCATION:
         """
         base_reloc = cls()
         base_reloc.virtual_address = virtual_address
+        base_reloc.is_word_sized = is_word_sized
+        if is_word_sized:
+            struct_size = 2
+        else:
+            struct_size = 4
         # If there is an odd number of type offsets, add a padding type offset
-        if len(type_offsets) % 2 != 0:
+        if is_word_sized and len(type_offsets) % 2 != 0:
             base_reloc.num_of_type_offsets = len(type_offsets) + 1
             base_reloc.has_padding = True
         else:
             base_reloc.num_of_type_offsets = len(type_offsets)
             base_reloc.has_padding = False
-        base_reloc.size_of_block = cls.sizeof + base_reloc.num_of_type_offsets * 2
+        base_reloc.size_of_block = cls.sizeof + base_reloc.num_of_type_offsets * struct_size
         base_reloc.type_offsets = type_offsets
         return base_reloc
 
@@ -218,10 +235,14 @@ class IMAGE_BASE_RELOCATION:
 
     def dump(self) -> bytearray:
         # empty bytes at the end for padding
-        packed_base_relocation = bytearray(struct.pack('<II' + 'H'*(len(self.type_offsets)), self.virtual_address,
+        if self.is_word_sized:
+            struct_type, struct_size = 'H', 2
+        else:
+            struct_type, struct_size = 'I', 4
+        packed_base_relocation = bytearray(struct.pack('<II' + struct_type*(len(self.type_offsets)), self.virtual_address,
                 self.size_of_block, *[(rva & 0xFFF) + (offset_type << 12) for rva,offset_type in self.type_offsets]))
         if self.has_padding:
-            packed_base_relocation += b'\x00\x00'
+            packed_base_relocation += b'\x00' * struct_size
         return packed_base_relocation
     
 
@@ -279,6 +300,7 @@ class IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION:
         fo_dyn_reloc.rva_size = len(rva_list) * 4
         fo_dyn_reloc.base_relocations = base_relocations
         fo_dyn_reloc.base_reloc_size = sum([reloc.size_of_block for reloc in base_relocations])
+        fo_dyn_reloc.total_size = fo_dyn_reloc.sizeof + fo_dyn_reloc.rva_size + fo_dyn_reloc.base_reloc_size
         return fo_dyn_reloc
     
     def __repr__(self) -> str:
@@ -327,16 +349,15 @@ class IMAGE_FUNCTION_OVERRIDE_HEADER:
     
 
     @classmethod
-    def from_data(cls, func_override_info: List[IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION]) -> 'IMAGE_FUNCTION_OVERRIDE_HEADER':
+    def from_data(cls, func_override_info: List[IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION], bdd_info: 'IMAGE_BDD_INFO') -> 'IMAGE_FUNCTION_OVERRIDE_HEADER':
         """
         Creates an IMAGE_FUNCTION_OVERRIDE_HEADER object from the given data
-        :param virtual_address: virtual address of the base relocation
-        :param type_offsets: list of type offsets
         :return: IMAGE_FUNCTION_OVERRIDE_HEADER object
         """
         header = cls()
         header.func_override_size = sum([fo_reloc.total_size for fo_reloc in func_override_info])
         header.func_override_info = func_override_info
+        header.bdd_info = bdd_info
         return header
 
     def __repr__(self) -> str:
@@ -375,10 +396,8 @@ class IMAGE_BDD_DYNAMIC_RELOCATION:
     @classmethod
     def from_data(cls, left, right, value):
         """
-        Creates an IMAGE_FUNCTION_OVERRIDE_HEADER object from the given data
-        :param virtual_address: virtual address of the base relocation
-        :param type_offsets: list of type offsets
-        :return: IMAGE_FUNCTION_OVERRIDE_HEADER object
+        Creates an IMAGE_BDD_DYNAMIC_RELOCATION object from the given data
+        :return: IMAGE_BDD_DYNAMIC_RELOCATION object
         """
         bdd_reloc = cls()
         bdd_reloc.left, bdd_reloc.right, bdd_reloc.value = left, right, value
@@ -421,10 +440,8 @@ class IMAGE_BDD_INFO:
     @classmethod
     def from_data(cls, version: int, bdd_nodes_list: List[IMAGE_BDD_DYNAMIC_RELOCATION]) -> 'IMAGE_BDD_INFO':
         """
-        Creates an IMAGE_FUNCTION_OVERRIDE_HEADER object from the given data
-        :param virtual_address: virtual address of the base relocation
-        :param type_offsets: list of type offsets
-        :return: IMAGE_FUNCTION_OVERRIDE_HEADER object
+        Creates an IMAGE_BDD_INFO object from the given data
+        :return: IMAGE_BDD_INFO object
         """
         bdd_info = cls()
         bdd_info.version = version
