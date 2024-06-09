@@ -93,7 +93,7 @@ class IMAGE_DYNAMIC_RELOCATION:
         self.symbol: int = None
         self.base_reloc_size: int = None
         self.base_relocations: List[IMAGE_BASE_RELOCATION] = []
-        self.function_override_header: IMAGE_FUNCTION_OVERRIDE_HEADER = None
+        self.function_override_header: Optional[IMAGE_FUNCTION_OVERRIDE_HEADER] = None
 
     @classmethod
     def from_bytes(cls, raw_data: bytes) -> 'IMAGE_DYNAMIC_RELOCATION':
