@@ -230,7 +230,7 @@ def calculate_jumptable_size(ea: int, parsed_size: int) -> int:
             heur_element_num = idc.get_operand_value(prev_insn, 1) + 1
             break
         # This is indicative of an additional indirect table usage
-        elif idc.print_insn_mnem(prev_insn) == 'movzx' and idc.print_operand(prev_insn, 0).endswith('ax'):
+        elif idc.print_insn_mnem(prev_insn) == 'movzx' and idc.print_operand(prev_insn, 0).endswith(('ax', 'cx', 'dx')):
             found_indirect_table = True
         prev_insn = idc.prev_head(prev_insn)
     if found_indirect_table == False and heur_element_num > element_num:
