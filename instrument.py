@@ -195,7 +195,7 @@ def inject_code(addr: int, injections: Dict[int, Code], shellcode: bytes = b'', 
     :param injections: A dict that holds info about all the injections.
     :param shellcode: Shellcode to inject
     :param expand: New bytes to add for relative instruction expansion (e.g. short jmp to far jmp)
-    :param is_bb_start: Is it injection of a start of a basic block
+    :param is_bb_start: Is this an injection of a start of a basic block
     :return:
     """
     # expand is a partial operand for expanding from short jump to long jump
