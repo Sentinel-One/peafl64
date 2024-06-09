@@ -40,11 +40,8 @@ import sys
 import codecs
 import time
 import math
-import re
 import string
-import array
 import mmap
-import ordlookup
 
 from collections import Counter
 from hashlib import sha1
@@ -3875,11 +3872,6 @@ class PE(object):
                 dll = b('*invalid*')
 
             if dll:
-                for symbol in import_data:
-                    if symbol.name is None:
-                        funcname = ordlookup.ordLookup(dll.lower(), symbol.ordinal)
-                        if funcname:
-                            symbol.name = funcname
                 import_descs.append(
                     ImportDescData(
                         struct = import_desc,
@@ -3907,9 +3899,7 @@ class PE(object):
             for imp in entry.imports:
                 funcname = None
                 if not imp.name:
-                    funcname = ordlookup.ordLookup(entry.dll.lower(), imp.ordinal, make_name=True)
-                    if not funcname:
-                        raise Exception("Unable to look up ordinal %s:%04x" % (entry.dll, imp.ordinal))
+                    raise Exception("Unable to look up ordinal %s:%04x" % (entry.dll, imp.ordinal))
                 else:
                     funcname = imp.name
 
@@ -3987,11 +3977,6 @@ class PE(object):
                 dll = b('*invalid*')
 
             if dll:
-                for symbol in import_data:
-                    if symbol.name is None:
-                        funcname = ordlookup.ordLookup(dll.lower(), symbol.ordinal)
-                        if funcname:
-                            symbol.name = funcname
                 import_descs.append(
                     ImportDescData(
                         struct = import_desc,
